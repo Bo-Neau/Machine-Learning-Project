@@ -1,0 +1,581 @@
+---
+title: "CW 5.0 Classification"
+output: html_document
+date: "2025-03-17"
+---
+
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(sqldf)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(ggcorrplot)
+library(caret)
+library(gridExtra)
+library(data.table)
+library(MLmetrics)
+library(glmnet)
+library(pROC)
+library(randomForest)
+library(PRROC)
+
+```
+
+
+```{r}
+# Read training and testing data
+training_data <- fread("training_sample.csv", stringsAsFactors = FALSE)
+testing_data  <- fread("testing_sample.csv", stringsAsFactors = FALSE)
+
+# Combine datasets for feature engineering
+original_data <- rbind(training_data, testing_data)
+
+# Check dimensions
+cat("Dataset Dimensions:", dim(original_data), "\n")
+
+# Check missing values
+cat("\nMissing Values per Column:\n")
+print(colSums(is.na(original_data)))
+
+# Identify numeric features
+numeric_cols <- sapply(original_data, is.numeric)  
+numeric_features <- names(original_data)[numeric_cols]  
+
+cat("\nNumeric Features in Dataset:\n")
+print(numeric_features)
+
+```
+
+
+```{r}
+# Feature Engineering: Behavioral Features
+original_data$engagement_score <- rowSums(original_data[, c("saw_homepage", "saw_sizecharts", "saw_delivery", "promo_banner_click", "image_picker"), with = FALSE])
+
+original_data$intent_score <- rowSums(original_data[, c("basket_icon_click", "basket_add_list", "basket_add_detail", "checked_delivery_detail", "checked_returns_detail"), with = FALSE])
+
+original_data$conversion_score <- rowSums(original_data[, c("saw_checkout", "sign_in", "ordered"), with = FALSE])
+
+# Additional features
+original_data$basket_activity <- rowSums(original_data[, c("basket_icon_click", "basket_add_list", "basket_add_detail"), with = FALSE])
+original_data$checkout_actions <- rowSums(original_data[, c("saw_checkout", "sign_in"), with = FALSE])
+
+# Encode Device Type Usage (1 if used, 0 if not)
+original_data$device_usage <- rowSums(original_data[, c("device_mobile", "device_tablet", "device_computer"), with = FALSE])
+
+# Check dataset structure
+cat("\nFeature-Engineered Dataset:\n")
+print(names(original_data))
+
+```
+
+
+```{r}
+# Select relevant numerical features for correlation
+selected_features <- c("engagement_score", "intent_score", "conversion_score", "basket_activity", "checkout_actions", "device_usage", "ordered")
+
+# Compute correlation matrix
+cor_matrix <- cor(original_data[, selected_features, with = FALSE], use = "pairwise.complete.obs")
+
+# Plot heatmap of correlations
+ggcorrplot(cor_matrix, method = "square", lab = TRUE, title = "Correlation Heatmap (Feature Engineered Data)", colors = c("blue", "white", "red"))
+
+```
+
+
+```{r}
+# Convert 'ordered' to factor
+original_data$ordered <- as.factor(original_data$ordered)
+
+# Plot Feature Distributions
+p1 <- ggplot(original_data, aes(x = ordered, y = engagement_score, fill = ordered)) +
+  geom_boxplot() + theme_minimal() + labs(title = "Engagement Score vs. Purchase Decision")
+
+p2 <- ggplot(original_data, aes(x = ordered, y = intent_score, fill = ordered)) +
+  geom_boxplot() + theme_minimal() + labs(title = "Intent Score vs. Purchase Decision")
+
+p3 <- ggplot(original_data, aes(x = ordered, y = conversion_score, fill = ordered)) +
+  geom_boxplot() + theme_minimal() + labs(title = "Conversion Score vs. Purchase Decision")
+
+p4 <- ggplot(original_data, aes(x = ordered, y = basket_activity, fill = ordered)) +
+  geom_boxplot() + theme_minimal() + labs(title = "Basket Activity vs. Purchase Decision")
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+```
+
+
+```{r}
+# Check the class distribution
+cat("\nOriginal Class Distribution:\n")
+print(table(original_data$ordered))
+
+# Separate majority and minority class
+majority_class <- original_data %>% filter(ordered == 0)
+minority_class <- original_data %>% filter(ordered == 1)
+
+# Oversample the minority class (Duplicate rows randomly)
+set.seed(42)
+
+# Define the undersampling ratio (5:1)
+minority_count <- nrow(minority_class)
+majority_undersample_count <- minority_count * 10  
+
+# Undersample majority class
+undersampled_majority <- majority_class %>%
+  sample_n(majority_undersample_count)
+
+# Combine new dataset
+balanced_undersample_data <- bind_rows(undersampled_majority, minority_class)
+
+# Shuffle the dataset
+balanced_undersample_data <- balanced_undersample_data %>% sample_frac(1)
+
+# Check new class distribution
+cat("\nBalanced Class Distribution :\n")
+print(table(balanced_undersample_data$ordered))
+
+# Plot new class distribution
+ggplot(balanced_undersample_data, aes(x = ordered, fill = ordered)) +
+  geom_bar() +
+  labs(title = "Balanced Class Distribution ", x = "Purchase (0 = No, 1 = Yes)", y = "Count") +
+  theme_minimal()
+```
+
+
+```{r}
+# Set seed for reproducibility
+set.seed(42)
+
+# Split into training (80%) and testing (20%) sets
+train_index <- createDataPartition(balanced_undersample_data$ordered, p = 0.8, list = FALSE)
+
+train_data <- balanced_undersample_data[train_index, ]
+test_data <- balanced_undersample_data[-train_index, ]
+
+# Check new dataset dimensions
+cat("\nTraining Data Size:", dim(train_data), "\n")
+cat("Testing Data Size:", dim(test_data), "\n")
+
+# Check class distribution in training and test sets
+cat("\nClass Distribution in Training Data:\n")
+print(table(train_data$ordered))
+
+cat("\nClass Distribution in Test Data:\n")
+print(table(test_data$ordered))
+```
+
+
+```{r}
+cat("\nColumns in Train Data:\n")
+print(names(train_data))
+
+cat("\nColumns in Test Data:\n")
+print(names(test_data))
+```
+
+
+```{r}
+# Convert to DataFrame
+train_data <- as.data.frame(train_data)
+test_data <- as.data.frame(test_data)
+
+# Drop UserID
+train_data <- train_data[, !(names(train_data) %in% "UserID")]
+test_data <- test_data[, !(names(test_data) %in% "UserID")]
+
+# Convert 'ordered' to a factor for classification
+train_data$ordered <- as.factor(train_data$ordered)
+test_data$ordered <- as.factor(test_data$ordered)
+
+# Print class distribution for verification
+cat("\n🚀 Class Distribution in Train Data:\n")
+print(table(train_data$ordered))
+
+cat("\n🚀 Class Distribution in Test Data:\n")
+print(table(test_data$ordered))
+```
+
+```{r}
+# Define predictors correctly
+predictors <- setdiff(names(train_data), "ordered")
+
+# Print confirmation
+cat("\n✅ Selected Predictors:\n")
+print(predictors)
+```
+
+```{r}
+# Convert 'ordered' column to factor with proper labels
+train_data$ordered <- factor(train_data$ordered, levels = c(0, 1), labels = c("No", "Yes"))
+test_data$ordered <- factor(test_data$ordered, levels = c(0, 1), labels = c("No", "Yes"))
+
+# Verify class labels
+print(table(train_data$ordered))
+print(table(test_data$ordered))
+```
+
+```{r}
+# Define training control with cross-validation
+ctrl <- trainControl(
+  method = "cv",         
+  number = 5,            
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary 
+)
+```
+
+```{r}
+# Train Logistic Regression
+set.seed(42)
+logistic_model <- train(
+  ordered ~ ., 
+  data = train_data, 
+  method = "glmnet",  # Lasso or Ridge regression
+  trControl = ctrl, 
+  metric = "ROC",
+  tuneGrid = expand.grid(alpha = c(0, 0.5, 1), lambda = seq(0.0001, 0.1, length = 10)) # Hyperparameter tuning
+)
+
+# Print results
+print(logistic_model)
+```
+
+```{r}
+# Train Random Forest Model
+set.seed(42)
+rf_model <- train(
+  ordered ~ ., 
+  data = train_data, 
+  method = "rf", 
+  trControl = ctrl, 
+  metric = "ROC"
+)
+
+# Print results
+print(rf_model)
+
+```
+
+
+```{r}
+# Predict on Test Data
+predictions <- predict(logistic_model, newdata = test_data, type = "prob")
+
+# Convert Probabilities to Class Labels
+predicted_class <- ifelse(predictions[, "Yes"] > 0.5, "Yes", "No")
+
+# Confusion Matrix
+conf_matrix <- confusionMatrix(as.factor(predicted_class), as.factor(test_data$ordered))
+
+# Print Performance Metrics
+print(conf_matrix)
+```
+
+```{r}
+cor_matrix <- cor(train_data[, -which(names(train_data) == "ordered")])
+high_cor_features <- names(which(apply(cor_matrix, 2, function(x) any(abs(x) > 0.9 & abs(x) < 1))))
+
+# Remove highly correlated features
+train_data <- train_data[, !names(train_data) %in% high_cor_features]
+test_data <- test_data[, !names(test_data) %in% high_cor_features]
+
+```
+
+```{r}
+# Train a more regularized model
+set.seed(42)
+tuned_logistic_model <- train(
+  ordered ~ ., data = train_data, method = "glmnet",
+  trControl = trainControl(method = "cv", number = 5, classProbs = TRUE),
+  tuneGrid = expand.grid(alpha = c(0.1, 0.5, 1), lambda = seq(0.01, 1, length = 10)),
+  metric = "ROC"
+)
+# Evaluate performance again
+print(tuned_logistic_model)
+
+```
+
+```{r}
+tune_grid <- expand.grid(alpha = 0.5, lambda = seq(0.001, 0.02, length = 10))
+tuned_model <- train(
+  ordered ~ ., data = train_data, method = "glmnet",
+  trControl = trainControl(method = "cv", number = 5, classProbs = TRUE),
+  tuneGrid = tune_grid,
+  metric = "ROC"
+)
+print(tuned_model)
+```
+
+```{r}
+# Predict on test data and Confusion matrix
+test_predictions <- predict(tuned_model, newdata = test_data)
+test_probabilities <- predict(tuned_model, newdata = test_data, type = "prob")
+conf_matrix <- confusionMatrix(test_predictions, test_data$ordered)
+print(conf_matrix)
+
+```
+
+```{r}
+# Get variable importance
+importance <- varImp(tuned_model, scale = TRUE)
+
+# Convert to data frame for visualization
+importance_df <- data.frame(
+  Feature = rownames(importance$importance),
+  Importance = importance$importance$Overall
+)
+
+# Plot feature importance
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance - glmnet Model",
+       x = "Features", y = "Importance Score") +
+  theme_minimal()
+
+```
+
+```{r}
+# Get predicted probabilities
+pred_probs <- predict(tuned_model, newdata = test_data, type = "prob")
+
+# Compute ROC curve
+roc_curve <- roc(test_data$ordered, pred_probs$Yes)
+
+# Plot ROC curve
+plot(roc_curve, col = "blue", main = "ROC Curve - glmnet Model")
+abline(a = 0, b = 1, lty = 2, col = "red") 
+```
+
+```{r}
+# Generate confusion matrix
+conf_matrix <- confusionMatrix(test_predictions, test_data$ordered)
+conf_table <- as.data.frame(conf_matrix$table)
+
+# Visualize as a heatmap
+ggplot(data = conf_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), vjust = 0.5, size = 5) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix", x = "Actual", y = "Predicted") +
+  theme_minimal()
+```
+
+```{r}
+# Get predicted probabilities for the positive class
+pred_probs <- predict(tuned_model, newdata = test_data, type = "prob")
+positive_class_probs <- pred_probs$Yes  # Adjust if your positive class label is different
+
+# Convert actual labels to binary (1 = positive class, 0 = negative)
+true_labels <- ifelse(test_data$ordered == "Yes", 1, 0)
+
+# Generate PR curve
+pr_curve <- pr.curve(scores.class0 = positive_class_probs,
+                     weights.class0 = true_labels,
+                     curve = TRUE)
+
+# Plot with color gradient
+plot(pr_curve,
+     main = "Precision-Recall Curve - glmnet Model",
+     auc.main = TRUE,
+     color = TRUE,
+     legend = TRUE)
+```
+
+
+```{r}
+# Set seed for reproducibility
+set.seed(42)
+
+# Sample 30% of the training data (adjust percentage if needed)
+train_sample <- train_data %>%
+  group_by(ordered) %>%
+  sample_frac(0.3) %>%
+  ungroup()
+
+# Check new sample size
+cat("\n✅ Sampled Training Data Size:", dim(train_sample), "\n")
+```
+
+```{r}
+# Set seed
+set.seed(42)
+
+# Train Random Forest Model on Sampled Data
+rf_model <- train(
+  ordered ~ ., 
+  data = train_sample, 
+  method = "rf", 
+  trControl = trainControl(method = "cv", number = 3, classProbs = TRUE),  # Reduce cross-validation folds
+  metric = "ROC",
+  tuneGrid = expand.grid(mtry = c(3, 5, 7)),  # Fewer options for faster tuning
+  ntree = 100  # Reduce the number of trees
+)
+
+# Print model summary
+print(rf_model)
+
+```
+
+```{r}
+# Predict on test data
+rf_predictions <- predict(rf_model, newdata = test_data)
+rf_probabilities <- predict(rf_model, newdata = test_data, type = "prob")
+
+# Compute Confusion Matrix
+rf_conf_matrix <- confusionMatrix(rf_predictions, test_data$ordered)
+print(rf_conf_matrix)
+```
+
+```{r}
+# Extract confusion matrix table
+cm_table <- as.table(rf_conf_matrix$table)
+
+# Convert to data frame for ggplot
+cm_df <- as.data.frame(cm_table)
+colnames(cm_df) <- c("Prediction", "Reference", "Freq")
+
+# Plot using ggplot2
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 6) +
+  scale_fill_gradient(low = "#e0f3db", high = "#43a2ca") +
+  labs(title = "Confusion Matrix (Random Forest)",
+       x = "Actual Class", y = "Predicted Class") +
+  theme_minimal() +
+  theme(text = element_text(size = 12))
+
+```
+
+
+```{r}
+# Compute ROC Curve
+rf_roc_curve <- roc(test_data$ordered, rf_probabilities$Yes)
+plot(rf_roc_curve, col = "blue", main = "ROC Curve - Random Forest Model")
+abline(a = 0, b = 1, lty = 2, col = "red")
+
+```
+
+```{r}
+# Get Variable Importance
+rf_importance <- varImp(rf_model)
+
+# Convert to DataFrame for Plotting
+rf_importance_df <- data.frame(
+  Feature = rownames(rf_importance$importance),
+  Importance = rf_importance$importance$Overall
+)
+
+# Plot Feature Importance
+ggplot(rf_importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance - Random Forest Model",
+       x = "Features", y = "Importance Score") +
+  theme_minimal()
+```
+
+```{r}
+# Create a dataframe with actuals and predicted scores
+gain_df <- data.frame(
+  actual = ifelse(test_data$ordered == "Yes", 1, 0),
+  score = gbm_preds
+)
+
+# Sort by predicted score (descending)
+gain_df <- gain_df[order(-gain_df$score), ]
+gain_df$index <- seq_len(nrow(gain_df))
+
+# Compute cumulative actuals
+gain_df$cumulative_actual <- cumsum(gain_df$actual)
+gain_df$percent_customers <- gain_df$index / nrow(gain_df)
+gain_df$percent_positives <- gain_df$cumulative_actual / sum(gain_df$actual)
+
+# Plot Cumulative Gain
+ggplot(gain_df, aes(x = percent_customers, y = percent_positives)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  labs(
+    title = "Cumulative Gain Chart",
+    x = "Percentage of Customers (Targeted)",
+    y = "Percentage of Buyers Captured"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+
+# Convert to binary
+actual_bin <- ifelse(test_data$ordered == "Yes", 1, 0)
+pr <- pr.curve(scores.class0 = rf_probabilities$Yes[actual_bin == 1],
+               scores.class1 = rf_probabilities$Yes[actual_bin == 0],
+               curve = TRUE)
+
+plot(pr, main = "Precision-Recall Curve - Random Forest")
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
