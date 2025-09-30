@@ -1,0 +1,581 @@
+---
+title: "CW 5.0"
+output: html_document
+date: "2025-03-15"
+---
+
+```{r}
+# Load necessary libraries
+library(sqldf)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(qgraph)
+library(factoextra)
+library(caret)
+library(cluster)
+library(FactoMineR)
+library(reshape2)
+library(ggcorrplot)
+library(plotly)
+library(gridExtra)
+library(mclust)
+library(RColorBrewer)
+```
+
+
+```{r}
+# Read training and testing data
+training_data <- read.csv("training_sample.csv", stringsAsFactors = FALSE)
+testing_data  <- read.csv("testing_sample.csv", stringsAsFactors = FALSE)
+
+# Combine datasets
+combined_data <- sqldf("SELECT * FROM training_data UNION ALL SELECT * FROM testing_data")
+
+# Check dimensions
+cat("Dataset Dimensions:", dim(combined_data), "\n")
+
+# Check missing values
+cat("\nMissing Values per Column:\n")
+print(colSums(is.na(combined_data)))
+
+# Identify numeric features
+numeric_cols <- sapply(combined_data, is.numeric)  
+numeric_features <- names(combined_data)[numeric_cols]  
+
+cat("\nNumeric Features in Dataset:\n")
+print(numeric_features)
+```
+
+
+
+```{r}
+
+# Identify numeric columns correctly
+numeric_cols <- sapply(combined_data, is.numeric)
+numeric_features <- names(combined_data)[numeric_cols]
+
+# Identify Binary Features (Containing Only 0 and 1)
+binary_features <- names(Filter(function(x) all(unique(x) %in% c(0, 1)), combined_data[numeric_features]))
+
+if (length(binary_features) > 0) {
+  # Convert Data to Long Format for Plotting
+  combined_data_long <- melt(combined_data[, binary_features])
+
+  # Create Bar Plots for Binary Features
+  ggplot(combined_data_long, aes(x = factor(value), fill = variable)) +
+    geom_bar(alpha = 0.7, position = "dodge") +  
+    facet_wrap(~variable, scales = "free", ncol = 5) +
+    theme_minimal() +
+    scale_x_discrete(limits = c("0", "1")) +  
+    labs(title = "Distribution of Features", x = "Value", y = "Count") +
+    theme(axis.text.x = element_text(angle = 0, hjust = 0.5), legend.position = "none")
+} else {
+  cat("\nNo Binary Features Found in Dataset!\n")
+}
+```
+
+```{r}
+# Remove Low-Variance Features Before Correlation Computation
+filtered_numeric_features <- names(Filter(function(x) var(x, na.rm = TRUE) > 0, combined_data[numeric_features]))
+
+if (length(filtered_numeric_features) > 1) {
+  # Compute Pearson Correlation
+  cor_matrix <- cor(combined_data[, filtered_numeric_features], use = "pairwise.complete.obs")
+
+  # Plot Heatmap
+  ggcorrplot::ggcorrplot(
+    cor_matrix, 
+    method = "square", 
+    lab = FALSE,  
+    title = "Correlation Heatmap",
+    colors = c("blue", "white", "red")
+  )
+} else {
+  cat("\nNot Enough Numeric Features to Compute Correlation Matrix!\n")
+}
+```
+
+
+```{r}
+# Feature engineering: Aggregate behavioral scores
+combined_data$engagement_score <- rowSums(combined_data[, c("saw_homepage", "saw_sizecharts", "saw_delivery", "promo_banner_click", "image_picker")])
+
+combined_data$intent_score <- rowSums(combined_data[, c("basket_icon_click", "basket_add_list", "basket_add_detail", "checked_delivery_detail", "checked_returns_detail")])
+
+combined_data$conversion_score <- rowSums(combined_data[, c("saw_checkout", "sign_in", "ordered")])
+
+# Drop individual features to reduce redundancy
+combined_data <- combined_data[, !names(combined_data) %in% c("saw_homepage", "saw_sizecharts", "saw_delivery", "promo_banner_click", "image_picker", "basket_icon_click", "basket_add_list", "basket_add_detail", "checked_delivery_detail", "checked_returns_detail", "saw_checkout", "sign_in", "ordered")]
+
+# Drop device-related columns (Optional)
+combined_data <- combined_data[, !names(combined_data) %in% c("device_mobile", "device_tablet", "device_computer")]
+
+# Check new dataset structure
+cat("\nFinal Selected Features for Clustering:\n")
+print(names(combined_data))
+
+```
+
+
+```{r}
+# Standardize the behavioral scores
+scaled_data <- scale(combined_data[, c("engagement_score", "intent_score", "conversion_score")])
+
+# Compute WSS for different clusters
+wss <- sapply(2:10, function(k) kmeans(scaled_data, centers = k, nstart = 10)$tot.withinss)
+
+# Plot Elbow Method
+plot(2:10, wss, type = "b", pch = 19, frame = FALSE, xlab = "Number of Clusters", ylab = "WSS", main = "Elbow Method for Optimal Clusters")
+
+```
+
+
+```{r}
+set.seed(50)
+
+# Take a random sample of 10,000 rows (adjust as needed)
+sample_size <- 10000  
+sample_indices <- sample(nrow(scaled_data), sample_size)
+sample_data <- scaled_data[sample_indices, ]
+
+# Compute silhouette score for different clusters
+sil_scores <- sapply(2:10, function(k) {
+  km_res <- kmeans(sample_data, centers = k, nstart = 10)
+  mean(silhouette(km_res$cluster, dist(sample_data))[, 3])
+})
+
+# Plot Silhouette Method
+plot(2:10, sil_scores, type = "b", pch = 19, frame = FALSE, xlab = "Number of Clusters", ylab = "Average Silhouette Width", main = "Silhouette Method for Clustering")
+
+```
+
+
+```{r}
+set.seed(50)
+optimal_clusters <- 8  
+
+# Apply K-Means
+kmeans_result <- kmeans(scaled_data, centers = optimal_clusters, nstart = 10)
+
+# Add cluster labels to the dataset
+combined_data$cluster <- as.factor(kmeans_result$cluster)
+
+# Print cluster sizes
+cat("\nCluster sizes:\n")
+print(table(combined_data$cluster))
+
+```
+
+
+```{r}
+ggplot(combined_data, aes(x = cluster, fill = cluster)) +
+  geom_bar() +
+  labs(title = "Cluster Distribution", x = "Cluster", y = "Count") +
+  theme_minimal()
+
+```
+
+
+```{r}
+# Compute mean feature values per cluster
+cluster_profiles <- aggregate(combined_data[, c("engagement_score", "intent_score", "conversion_score")], 
+                              by = list(combined_data$cluster), mean)
+
+# Convert to long format for visualization
+cluster_profiles_long <- melt(cluster_profiles, id.vars = "Group.1")
+
+# Plot cluster characteristics
+ggplot(cluster_profiles_long, aes(x = Group.1, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Cluster Profile Summary", x = "Cluster", y = "Average Score") +
+  theme_minimal()
+
+```
+
+
+```{r}
+set.seed(50)
+
+# Take a smaller sample for efficiency
+sample_size <- 10000  
+sample_indices <- sample(nrow(scaled_data), sample_size)
+sample_data <- scaled_data[sample_indices, ]
+
+# Compute silhouette scores
+silhouette_scores <- silhouette(kmeans_result$cluster[sample_indices], dist(sample_data))
+
+# Convert silhouette scores to a dataframe
+sil_df <- data.frame(Cluster = silhouette_scores[, 1], Silhouette_Width = silhouette_scores[, 3])
+
+# Print average silhouette score
+avg_silhouette <- mean(sil_df$Silhouette_Width)
+cat("\nAverage Silhouette Score:", avg_silhouette, "\n")
+
+# Compute silhouette score per cluster
+silhouette_by_cluster <- aggregate(Silhouette_Width ~ Cluster, data = sil_df, mean)
+
+# Print silhouette score per cluster
+cat("\nSilhouette Scores by Cluster:\n")
+print(silhouette_by_cluster)
+
+# Plot silhouette scores
+ggplot(sil_df, aes(x = as.factor(Cluster), y = Silhouette_Width, fill = as.factor(Cluster))) +
+  geom_boxplot() +
+  labs(title = "Silhouette Scores by Cluster", x = "Cluster", y = "Silhouette Width") +
+  theme_minimal()
+
+```
+
+
+```{r}
+# Create a data frame for Plotly
+plotly_data <- data.frame(
+  Engagement = scaled_data[, "engagement_score"],
+  Intent = scaled_data[, "intent_score"],
+  Conversion = scaled_data[, "conversion_score"],
+  Cluster = as.factor(combined_data$cluster)  # Ensure clusters are categorical
+)
+
+# Define cluster colors
+cluster_colors <- c("red", "blue", "green", "purple", "orange", "pink", "cyan", "yellow")
+
+# Create 3D scatter plot
+plot_3d <- plot_ly(
+  data = plotly_data,
+  x = ~Engagement, y = ~Intent, z = ~Conversion,
+  color = ~Cluster, colors = cluster_colors,
+  marker = list(size = 5)
+) %>%
+  layout(
+    title = "3D Clustering Visualization",
+    scene = list(
+      xaxis = list(title = "Engagement Score"),
+      yaxis = list(title = "Intent Score"),
+      zaxis = list(title = "Conversion Score")
+    )
+  )
+
+# Display 3D plot
+plot_3d
+```
+
+
+```{r}
+# Define Cluster Names
+cluster_names <- c(
+  "1" = "Low-Engagement Browsers",
+  "2" = "Window Shoppers",
+  "3" = "Majority Silent Users",
+  "4" = "High-Intent Hesitators",
+  "5" = "Active Explorers",
+  "6" = "Committed Buyers",
+  "7" = "Casual Checkouts",
+  "8" = "Indecisive Visitors"
+)
+
+# Convert cluster column to factor
+combined_data$cluster <- as.factor(combined_data$cluster)
+cluster_profiles$Group.1 <- as.factor(cluster_profiles$Group.1)
+
+# Prepare Data for Line Plot (Scale by 100)
+cluster_profile_long <- melt(cluster_profiles, id.vars = "Group.1")  
+cluster_profile_long$value <- cluster_profile_long$value * 100000  
+# ---- Create Bar Plot (Cluster Distribution) ----
+bar_plot <- ggplot(combined_data, aes(x = as.factor(cluster), fill = as.factor(cluster))) +
+  geom_bar() +
+  labs(title = "Cluster Distribution with Average Feature Values", x = "Cluster Label", y = "Number of Customers") +
+  theme_minimal() +
+  scale_fill_manual(values = c("darkblue", "steelblue", "gray", "darkgreen", "orange", "purple", "pink", "brown")) +
+  scale_x_discrete(labels = cluster_names) +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Create Line Plot (Feature Values per Cluster)
+line_plot <- ggplot(cluster_profile_long, aes(x = Group.1, y = value, color = variable, group = variable)) +
+  geom_line(size = 1.2) +  # Line for trend
+  geom_point(size = 3) +  # Add points
+  labs(y = "Average Score (Scaled x100000)") +  
+  scale_color_manual(values = c("red", "green", "blue")) +  
+  theme_minimal() +
+  scale_x_discrete(labels = cluster_names) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title.x = element_blank())
+
+# Combine Both Plots (Dual Y-Axis)
+final_plot <- ggplot() +
+  geom_bar(data = combined_data, aes(x = as.factor(cluster), fill = as.factor(cluster)), stat = "count") +
+  geom_line(data = cluster_profile_long, aes(x = Group.1, y = value, color = variable, group = variable), size = 1.2) +  
+  geom_point(data = cluster_profile_long, aes(x = Group.1, y = value, color = variable), size = 3) +
+  labs(title = "Cluster Distribution with Average Feature Values", x = "Cluster Label", y = "Number of Customers") +
+  scale_y_continuous(sec.axis = sec_axis(~./100, name = "Average Value (Scaled x100000)")) +  
+  scale_x_discrete(labels = cluster_names) +
+  scale_fill_manual(values = c("darkblue", "steelblue", "gray", "darkgreen", "orange", "purple", "pink", "brown")) +
+  scale_color_manual(values = c("red", "green", "blue")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Show Final Visualization
+print(final_plot)
+```
+
+
+```{r}
+set.seed(42)  # Ensure reproducibility
+
+# Fit GMM Model
+gmm_model <- Mclust(scaled_data)
+
+# Print model summary
+summary(gmm_model)
+
+# Extract BIC values for different models
+plot(gmm_model, what = "BIC")
+
+# ---- Step 2: Assign GMM Cluster Labels ----
+combined_data$gmm_cluster <- as.factor(gmm_model$classification)
+
+# Print Cluster Sizes
+cat("\nCluster Sizes (GMM):\n")
+print(table(combined_data$gmm_cluster))
+```
+
+
+```{r}
+# ---- Step 4: 3D Scatter Plot ----
+fig <- plot_ly(combined_data, x = ~engagement_score, y = ~intent_score, z = ~conversion_score,
+               color = ~gmm_cluster, colors = c("red", "blue", "green", "purple", "orange", "yellow", "cyan", "pink")) %>%
+  add_markers() %>%
+  layout(title = "GMM Clustering (3D Scatter Plot)",
+         scene = list(xaxis = list(title = 'Engagement Score'),
+                      yaxis = list(title = 'Intent Score'),
+                      zaxis = list(title = 'Conversion Score')))
+
+fig
+
+```
+
+
+```{r}
+# Extract cluster probabilities from the GMM model
+cluster_probabilities <- gmm_model$z  # Each row contains probabilities of belonging to each cluster
+
+# Assign the highest probability cluster
+combined_data$gmm_confidence <- apply(cluster_probabilities, 1, max)
+
+# Summary of confidence scores
+cat("\nSummary of Cluster Assignment Confidence:\n")
+summary(combined_data$gmm_confidence)
+
+```
+
+
+```{r}
+set.seed(50)
+
+# Define sample size (Adjustable)
+sample_size <- 10000  
+
+# Take a random sample of indices
+sample_indices <- sample(nrow(scaled_data), sample_size)
+
+# Extract the sample data
+sample_data <- scaled_data[sample_indices, ]
+
+# Extract the corresponding GMM cluster assignments
+sample_clusters <- combined_data$gmm_cluster[sample_indices]
+
+# Compute distance matrix on sampled data
+dist_matrix_sample <- dist(sample_data)
+
+# Compute silhouette scores on the sampled data
+silhouette_scores_gmm <- silhouette(as.numeric(sample_clusters), dist_matrix_sample)
+
+# Convert silhouette scores to a data frame for visualization
+sil_df_gmm <- data.frame(
+  Cluster = silhouette_scores_gmm[, 1],
+  Silhouette_Width = silhouette_scores_gmm[, 3]
+)
+
+# Compute and print the average silhouette score
+avg_silhouette_gmm <- mean(sil_df_gmm$Silhouette_Width)
+cat("\nAverage Silhouette Score for GMM (Sampled):", avg_silhouette_gmm, "\n")
+
+# Compute silhouette score per cluster
+silhouette_by_cluster_gmm <- aggregate(Silhouette_Width ~ Cluster, data = sil_df_gmm, mean)
+
+# Print silhouette score per cluster
+cat("\nSilhouette Scores by Cluster:\n")
+print(silhouette_by_cluster_gmm)
+
+# Plot silhouette scores
+ggplot(sil_df_gmm, aes(x = as.factor(Cluster), y = Silhouette_Width, fill = as.factor(Cluster))) +
+  geom_boxplot() +
+  labs(title = "Silhouette Scores by Cluster (Sampled - GMM)", x = "Cluster", y = "Silhouette Width") +
+  theme_minimal() +
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, "Set1"))(length(unique(sample_clusters))))
+
+```
+
+
+```{r}
+# Compute cluster means for key variables
+cluster_summary <- aggregate(. ~ gmm_cluster, data = combined_data[, c("gmm_cluster", "engagement_score", "intent_score", "conversion_score")], mean)
+
+# Reshape data for visualization
+cluster_summary_melted <- melt(cluster_summary, id.vars = "gmm_cluster")
+
+# Plot Cluster Profiles
+ggplot(cluster_summary_melted, aes(x = gmm_cluster, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Cluster Profile Summary (GMM)", x = "Cluster", y = "Mean Score") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set2")
+
+```
+
+
+```{r}
+# Compute cluster distribution
+cluster_distribution <- as.data.frame(table(combined_data$gmm_cluster))
+colnames(cluster_distribution) <- c("Cluster", "Count")
+
+# Plot Cluster Distribution
+ggplot(cluster_distribution, aes(x = Cluster, y = Count, fill = Cluster)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Cluster Distribution (GMM)", x = "Cluster", y = "Count") +
+  theme_minimal() +
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, "Set1"))(length(unique(combined_data$gmm_cluster))))
+
+```
+
+
+```{r}
+# Define Cluster Names
+gmm_cluster_names <- c("Interested Browsers", "Mass Market", "Potential Buyers", "Hesitant Shoppers", 
+                       "Active Explorers", "Engaged Non-Buyers", "High-Value Customers", 
+                       "Loyal Customers", "Impulse Buyers")
+
+# Compute cluster means for key variables
+gmm_cluster_summary <- aggregate(. ~ gmm_cluster, 
+                                 data = combined_data[, c("gmm_cluster", "engagement_score", "intent_score", "conversion_score")], 
+                                 mean)
+
+# Reshape data for visualization
+gmm_summary_melted <- melt(gmm_cluster_summary, id.vars = "gmm_cluster")
+
+# Compute cluster distribution
+gmm_cluster_distribution <- as.data.frame(table(combined_data$gmm_cluster))
+colnames(gmm_cluster_distribution) <- c("Cluster", "Count")
+
+# Prepare Data for Line Plot (Scaling for Dual Axis)
+gmm_summary_melted$value <- gmm_summary_melted$value * 100000  
+
+# Create Bar Plot (Cluster Distribution)
+bar_plot_gmm <- ggplot(gmm_cluster_distribution, aes(x = as.factor(Cluster), y = Count, fill = as.factor(Cluster))) +
+  geom_bar(stat = "identity") +
+  labs(title = "GMM Cluster Distribution with Average Feature Values", 
+       x = "Cluster Label", y = "Number of Customers") +
+  theme_minimal() +
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, "Set1"))(length(unique(combined_data$gmm_cluster)))) +
+  scale_x_discrete(labels = gmm_cluster_names) +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Create Line Plot (Feature Values per Cluster)
+line_plot_gmm <- ggplot(gmm_summary_melted, aes(x = as.factor(gmm_cluster), y = value, color = variable, group = variable)) +
+  geom_line(size = 1.2) +  
+  geom_point(size = 3) +  
+  labs(y = "Average Score (Scaled x100000)") +  
+  scale_color_manual(values = c("red", "green", "blue")) +  
+  theme_minimal() +
+  scale_x_discrete(labels = gmm_cluster_names) +  
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), axis.title.x = element_blank())
+
+# Combine Both Plots (Dual Y-Axis)
+final_gmm_plot <- ggplot() +
+  geom_bar(data = gmm_cluster_distribution, aes(x = as.factor(Cluster), y = Count, fill = as.factor(Cluster)), stat = "identity") +
+  geom_line(data = gmm_summary_melted, aes(x = as.factor(gmm_cluster), y = value, color = variable, group = variable), size = 1.2) +  
+  geom_point(data = gmm_summary_melted, aes(x = as.factor(gmm_cluster), y = value, color = variable), size = 3) +
+  labs(title = "GMM Cluster Distribution with Average Feature Values", 
+       x = "Cluster Label", y = "Number of Customers") +
+  scale_y_continuous(sec.axis = sec_axis(~./100, name = "Average Value (Scaled x100000)")) +  
+  scale_x_discrete(labels = gmm_cluster_names) +
+  scale_fill_manual(values = colorRampPalette(brewer.pal(9, "Set1"))(length(unique(combined_data$gmm_cluster)))) +
+  scale_color_manual(values = c("red", "green", "blue")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ---- Show Final GMM Visualization ----
+print(final_gmm_plot)
+
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+

@@ -1,0 +1,472 @@
+---
+title: "CW 5.2"
+output: html_document
+date: "2025-03-18"
+---
+
+
+```{r}
+library(ggplot2)
+library(reshape2)
+library(psych)
+library(gbm)
+library(Metrics)
+```
+
+
+```{r}
+# Extract predicted probabilities from Random Forest model
+train_data$propensity_score <- rf_model$pred$Yes
+
+# Select features for regression 
+regression_data <- train_data %>%
+  select(-ordered)  
+
+# Normalize numerical features using MinMax Scaling
+preprocess_params <- preProcess(regression_data, method = c("range")) 
+regression_data_scaled <- predict(preprocess_params, regression_data)
+
+# View summary
+summary(regression_data_scaled)
+```
+
+```{r}
+# Create interaction terms for train data
+train_data$basket_interaction <- train_data$basket_add_list * train_data$basket_add_detail
+train_data$delivery_returns <- train_data$checked_delivery_detail * train_data$checked_returns_detail
+train_data$list_minibasket <- train_data$list_size_dropdown * train_data$closed_minibasket_click
+train_data$mobile_promo <- train_data$device_mobile * train_data$promo_banner_click
+train_data$desktop_basket <- train_data$device_computer * train_data$basket_add_list
+train_data$tablet_account <- train_data$device_tablet * train_data$account_page_click
+train_data$returning_basket <- train_data$returning_user * train_data$basket_add_detail
+train_data$returning_delivery <- train_data$returning_user * train_data$checked_delivery_detail
+train_data$uk_delivery <- train_data$loc_uk * train_data$saw_delivery
+
+# Create interaction terms for test_data
+test_data$basket_interaction <- test_data$basket_add_list * test_data$basket_add_detail
+test_data$delivery_returns <- test_data$checked_delivery_detail * test_data$checked_returns_detail
+test_data$list_minibasket <- test_data$list_size_dropdown * test_data$closed_minibasket_click
+test_data$mobile_promo <- test_data$device_mobile * test_data$promo_banner_click
+test_data$desktop_basket <- test_data$device_computer * test_data$basket_add_list
+test_data$tablet_account <- test_data$device_tablet * test_data$account_page_click
+test_data$returning_basket <- test_data$returning_user * test_data$basket_add_detail
+test_data$returning_delivery <- test_data$returning_user * test_data$checked_delivery_detail
+test_data$uk_delivery <- test_data$loc_uk * test_data$saw_delivery
+
+```
+
+```{r}
+summary(train_data)
+summary(test_data)
+```
+
+
+```{r}
+# Convert categorical variables to numeric 
+train_data_numeric <- train_data
+train_data_numeric[] <- lapply(train_data_numeric, function(x) if(is.factor(x) || is.character(x)) as.numeric(as.factor(x)) else x)
+
+# Convert categorical variables to numeric
+train_data_numeric <- train_data
+train_data_numeric[] <- lapply(train_data_numeric, function(x) if(is.factor(x) || is.character(x)) as.numeric(as.factor(x)) else x)
+
+# Compute correlation matrix
+cor_matrix <- cor(train_data_numeric, use = "complete.obs")
+
+# Convert to a tidy format for visualization
+cor_melted <- reshape2::melt(cor_matrix)  # Explicitly call reshape2
+
+# Plot heatmap
+ggplot(cor_melted, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, 
+                       limit = c(-1,1), space = "Lab", name="Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 1, hjust=1)) +
+  labs(title = "Feature Correlation Heatmap")
+
+```
+
+```{r}
+# Select basket-related features for PCA
+basket_features <- train_data %>%
+  select(basket_icon_click, basket_add_list, basket_add_detail)
+
+# Standardize the features
+preproc <- preProcess(basket_features, method = c("center", "scale"))
+basket_features_scaled <- predict(preproc, basket_features)
+
+# Perform PCA
+pca_result <- prcomp(basket_features_scaled, center = TRUE, scale. = TRUE)
+
+# View proportion of variance explained
+summary(pca_result)
+
+# Keep only the first principal component
+train_data$basket_pca <- pca_result$x[,1]
+test_data$basket_pca <- predict(pca_result, predict(preproc, test_data[, c("basket_icon_click", "basket_add_list", "basket_add_detail")]))[,1]
+```
+
+```{r}
+# New interaction terms
+train_data$promo_account <- train_data$promo_banner_click * train_data$account_page_click
+train_data$device_promo <- train_data$device_usage * train_data$promo_banner_click
+train_data$returning_checkout <- train_data$returning_user * train_data$closed_minibasket_click
+train_data$checkout_promo <- train_data$closed_minibasket_click * train_data$promo_banner_click
+
+# Apply same transformations to test data
+test_data$promo_account <- test_data$promo_banner_click * test_data$account_page_click
+test_data$device_promo <- test_data$device_usage * test_data$promo_banner_click
+test_data$returning_checkout <- test_data$returning_user * test_data$closed_minibasket_click
+test_data$checkout_promo <- test_data$closed_minibasket_click * test_data$promo_banner_click
+```
+
+```{r}
+#Generate Propensity Scores
+train_data$propensity_score <- predict(rf_model, train_data, type = "prob")[, "Yes"]
+test_data$propensity_score <- predict(rf_model, test_data, type = "prob")[, "Yes"]
+
+# Train Linear Regression Model
+lm_model <- lm(propensity_score ~ ., data = train_data)
+
+# Summary of the model
+summary(lm_model)
+
+# Predict on test data
+lm_preds <- predict(lm_model, test_data)
+```
+
+```{r}
+# Train GBM Model
+gbm_model <- gbm(propensity_score ~ ., 
+                 data = train_data, 
+                 distribution = "gaussian",
+                 n.trees = 500, 
+                 interaction.depth = 5, 
+                 shrinkage = 0.01, 
+                 cv.folds = 5)
+
+# Get the best number of trees
+best_iter <- gbm.perf(gbm_model, method = "cv")
+
+# Predict on train and test data
+train_preds <- predict(gbm_model, train_data, n.trees = best_iter)
+test_preds <- predict(gbm_model, test_data, n.trees = best_iter)
+```
+
+```{r}
+# Linear Regression Metrics
+lm_rmse <- rmse(test_data$propensity_score, lm_preds)
+lm_mae <- mae(test_data$propensity_score, lm_preds)
+
+# Gradient Boosting Metrics
+gbm_rmse <- rmse(test_data$propensity_score, test_preds)
+gbm_mae <- mae(test_data$propensity_score, test_preds)
+
+# Print Results
+cat("Linear Regression - RMSE:", lm_rmse, "MAE:", lm_mae, "\n")
+cat("Gradient Boosting - RMSE:", gbm_rmse, "MAE:", gbm_mae, "\n")
+```
+
+```{r}
+# Tuning Hyperparameter
+tune_grid <- expand.grid(
+  n.trees = c(300, 500),
+  interaction.depth = c(3, 5),
+  shrinkage = c(0.01),
+  n.minobsinnode = c(10)
+)
+
+tuned_gbm <- train(
+  propensity_score ~ ., data = train_data,
+  method = "gbm",
+  trControl = trainControl(method = "cv", number = 5),
+  tuneGrid = tune_grid,
+  verbose = FALSE
+)
+
+print(tuned_gbm$bestTune)
+```
+
+```{r}
+# Train GBM Model with best hyperparameter
+final_gbm <- gbm(
+  propensity_score ~ ., 
+  data = train_data,
+  distribution = "gaussian",
+  n.trees = 500,  
+  interaction.depth = 5,
+  shrinkage = 0.01,
+  n.minobsinnode = 10,
+  verbose = FALSE
+)
+```
+
+```{r}
+# Predict & Evaluate Performance
+# Predict on Test Data
+gbm_preds <- predict(final_gbm, test_data, n.trees = 500)
+
+# Compute RMSE & MAE
+gbm_rmse <- sqrt(mean((test_data$propensity_score - gbm_preds)^2))
+gbm_mae <- mean(abs(test_data$propensity_score - gbm_preds))
+
+# Print Results
+cat(" GBM Performance:\n")
+cat("RMSE:", gbm_rmse, "\n")
+cat("MAE:", gbm_mae, "\n")
+
+```
+
+```{r}
+# Extract feature importance
+gbm_importance <- summary(final_gbm)
+
+# Convert to DataFrame
+gbm_importance_df <- data.frame(
+  Feature = gbm_importance$var,
+  Importance = gbm_importance$rel.inf
+)
+
+# Plot Feature Importance
+ggplot(gbm_importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance - Gradient Boosting Model",
+       x = "Features", y = "Importance Score") +
+  theme_minimal()
+```
+
+```{r}
+# Create DataFrame for plotting
+comparison_df <- data.frame(
+  Actual = test_data$propensity_score,
+  Predicted = gbm_preds
+)
+
+# Plot
+ggplot(comparison_df, aes(x = Actual, y = Predicted)) +
+  geom_point(alpha = 0.3, color = "dodgerblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Actual vs. Predicted Propensity Scores (GBM Model)",
+       x = "Actual Propensity Score",
+       y = "Predicted Propensity Score") +
+  theme_minimal()
+
+```
+
+```{r}
+# Compute residuals
+residuals <- test_data$propensity_score - gbm_preds
+
+# Plot residuals
+ggplot(data.frame(residuals), aes(x = residuals)) +
+  geom_histogram(binwidth = 0.01, fill = "darkgreen", color = "white") +
+  labs(title = "Residual Distribution (GBM Model)",
+       x = "Residual (Actual - Predicted)",
+       y = "Frequency") +
+  theme_minimal()
+
+```
+
+```{r}
+# Propensity Score Distribution
+ggplot(data.frame(Propensity = gbm_preds), aes(x = Propensity)) +
+  geom_histogram(binwidth = 0.02, fill = "orchid", color = "white") +
+  labs(title = "Distribution of Predicted Propensity Scores",
+       x = "Predicted Propensity Score",
+       y = "Customer Count") +
+  theme_minimal()
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
