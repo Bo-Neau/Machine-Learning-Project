@@ -1,7 +1,1 @@
-# Machine-Learning-Projects
-# Machine-Learning-Projects
-# Machine-Learning-Projects
-# Machine-Learning-Projects
-# Machine-Learning-Projects
-# Machine-Learning-Projects
-# Machine-Learning-Project
+# This is machine learning project for customer propensity to buy dataset
